@@ -97,7 +97,6 @@ solver = CholeskySolver(similar(x0, (n, n)))
 x, = lmsolve!(f!, j!, LM, p, solver=solver)
 
 # add constraints
-x0 = [1.0, 1.0]
 LM.x .= [-4.5, 4.5]
 lb = 0.5
 ub = SVector(4.0, 0.5)
