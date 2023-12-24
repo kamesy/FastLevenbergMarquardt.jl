@@ -8,7 +8,10 @@ using Test
 
 
 @testset "FastLevenbergMarquardt.jl" begin
-    Aqua.test_all(FastLevenbergMarquardt)
+    Aqua.test_all(
+        FastLevenbergMarquardt,
+        deps_compat=(ignore=[:LinearAlgebra, :SparseArrays, :SuiteSparse],)
+    )
 end
 
 
