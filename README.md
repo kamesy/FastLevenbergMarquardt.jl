@@ -100,5 +100,5 @@ x, = lmsolve!(f!, j!, LM, p, solver=solver)
 LM.x .= [-4.5, 4.5]
 lb = 0.5
 ub = SVector(4.0, 0.5)
-x, = lmsolve!(f!, j!, LM, p, solver=solver)
+x, = lmsolve!(f!, j!, LM, p, lb, ub, solver=solver)
 ```
