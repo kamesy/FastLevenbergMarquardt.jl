@@ -25,13 +25,17 @@ CholeskySolver(A::AbstractMatrix{<:AbstractFloat}) =
     CholeskySolver(A, similar(A))
 
 
-function init!(s::CholeskySolver, ::AbstractVector, L::LMWorkspace)
-    _mul!(s.JtJ, L.J', L.J)
+function init!(s::CholeskySolver, ::AbstractVector, L::LMWorkspace; newton::Bool)
+    if newton
+        copyto!(s.JtJ, L.J) # L.J is the Hessian
+    else
+        _mul!(s.JtJ, L.J', L.J) # L.J is the Jacobian
+    end
     return s
 end
 
-update!(s::CholeskySolver, f::AbstractVector, L::LMWorkspace) =
-    init!(s, f, L)
+update!(s::CholeskySolver, f::AbstractVector, L::LMWorkspace; newton::Bool) =
+    init!(s, f, L; newton)
 
 # solve (J'J + λD'D) * p = g = J'f
 function solve!(s::CholeskySolver, λ::Real, ::AbstractVector, L::LMWorkspace)
@@ -301,8 +305,10 @@ function init!(
     s::QRSolver{<:AbstractArray{<:BlasFloat}},
     f::AbstractVector{<:BlasFloat},
     L::LMWorkspace,
-    ::Val{lquery} = Val(true)
+    ::Val{lquery} = Val(true);
+    newton::Bool = false
 ) where {lquery}
+    newton && throw(ArgumentError("QRSolver does not support newton=true"))
     DtD, J, tau, jpvt, work = L.D, L.J, s.tau, s.jpvt, s.work
     jpvt = fill!(jpvt, 0)
     # QR decomp J
@@ -314,8 +320,8 @@ function init!(
     return s
 end
 
-update!(s::QRSolver, f::AbstractVector, L::LMWorkspace) =
-    init!(s, f, L, Val(false))
+update!(s::QRSolver, f::AbstractVector, L::LMWorkspace; newton::Bool = false) =
+    init!(s, f, L, Val(false); newton)
 
 # solve J*p = f, √λD*p = 0
 function solve!(s::QRSolver, λ::Real, f::AbstractVector, L::LMWorkspace)

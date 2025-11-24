@@ -163,6 +163,7 @@ function lmsolve!(
     lb::Union{Nothing, Real, AbstractVector{<:Real}} = nothing,
     ub::Union{Nothing, Real, AbstractVector{<:Real}} = nothing;
     solver::Union{Nothing, Symbol, AbstractSolver} = nothing,
+    newton::Bool = false,
     kwargs...
 ) where {FUN, JAC, P}
     x, J = LM.x, LM.J
@@ -170,7 +171,9 @@ function lmsolve!(
     @assert n == size(J, 2)
 
     if solver === nothing
-        if J isa SparseMatrixCSC || !(eltype(J) <: BlasFloat)
+        if newton
+            solver = :cholesky
+        elseif J isa SparseMatrixCSC || !(eltype(J) <: BlasFloat)
             solver = :cholesky
         else
             solver = :qr
@@ -183,6 +186,7 @@ function lmsolve!(
         elseif solver === :qr
             J isa SparseMatrixCSC && throw(ArgumentError(":qr for sparse Jacobian not implemented"))
             eltype(J) <: BlasFloat || throw(ArgumentError(":qr requires Float32 or Float64 arrays"))
+            newton && throw(ArgumentError(":qr is not supported when newton=true"))
             solver = QRSolver(similar(J, J isa StaticArray ? Size((n,)) : (n,)))
         else
             throw(ArgumentError("solver must be one of :cholesky, :qr"))
@@ -193,6 +197,7 @@ function lmsolve!(
         size(solver.JtJ, 1) == n || throw(DimensionMismatch("size(JtJ, 1) != size(J, 2)"))
         size(solver.JtJ, 2) == n || throw(DimensionMismatch("size(JtJ, 2) != size(J, 2)"))
     elseif solver isa QRSolver
+        newton && throw(ArgumentError("QRSolver is not supported when newton=true"))
         length(solver.tau)  == n || throw(DimensionMismatch("length(tau) != size(J, 2)"))
         length(solver.jpvt) == n || throw(DimensionMismatch("length(jpvt) != size(J, 2)"))
         size(LM.J, 2) <= size(LM.J, 1) || throw(ArgumentError("QRSolver not implemented for underdetermined problems"))
@@ -209,7 +214,7 @@ function lmsolve!(
         !all(lb .== ub) || throw(ArgumentError("lb == ub"))
     end
 
-    _lmsolve!(fun!, jac!, LM, data, lb, ub, solver; kwargs...)
+    _lmsolve!(fun!, jac!, LM, data, lb, ub, solver; newton, kwargs...)
 end
 
 
@@ -233,6 +238,7 @@ function _lmsolve!(
     maxscale::Real = 1e16,
     minfactor::Real = 1e-28,
     maxfactor::Real = 1e32,
+    newton::Bool = false,
 ) where {FUN, JAC, Tx, P}
     x, p, g, f, xk, fk = LM.x, LM.p, LM.g, LM.f, LM.xk, LM.fk
     J, DtD, w = LM.J, LM.D, LM.w
@@ -272,25 +278,32 @@ function _lmsolve!(
         @. x = min(x, ub)
     end
 
-    # compute f(x)
-    f = fun!(f, x, data)
-    nfev += 1
+    # compute initial values
+    if newton
+        # fused objective, gradient, and Hessian at x
+        F, f, J = with_gradient!(fun!, jacobian!, f, J, x, data; newton=true)
+        njev += 1
 
-    # initial objective
-    F = sum(abs2, f)
+        # compute g = f
+        copyto!(g, f)
+    else
+        # Gauss-Newton: f then J
+        F, f = with_objective!(fun!, f, x, data; newton)
+        nfev += 1
 
-    # early exit
-    if F < ϵc
-        converged = 1
-        return x, F, converged, 0, nfev, njev, LM, solver
+        # early exit
+        if F < ϵc
+            converged = 1
+            return x, F, converged, 0, nfev, njev, LM, solver
+        end
+
+        # compute jacobian J
+        J = jacobian!(J, x, data)
+        njev += 1
+
+        # compute g = J'f
+        g = _mul!(g, J', f)
     end
-
-    # compute jacobian J
-    J = jacobian!(J, x, data)
-    njev += 1
-
-    # compute g = J'f
-    g = _mul!(g, J', f)
 
     # early exit
     if norm(g, Inf) < ϵg
@@ -299,11 +312,15 @@ function _lmsolve!(
     end
 
     # init diagonal scaling
-    DtD = vec(sum!(abs2, DtD', J))
-    DtD = clamp!(DtD, Dlo, Inf)
+    if newton
+        fill!(DtD, one(T))
+    else
+        DtD = vec(sum!(abs2, DtD', J))
+        DtD = clamp!(DtD, Dlo, Inf)
+    end
 
     # init solver
-    solver = init!(solver, f, LM)
+    solver = init!(solver, f, LM; newton)
 
     # main loop
     iter = 0
@@ -311,6 +328,10 @@ function _lmsolve!(
 
     while iter < maxit
         iter += 1
+        Fk = F
+        ac = zero(T)
+        pr = one(T)
+        ρ = zero(T)
         accepted = false
 
         # solve (J'J + λD'D) * p = J'f
@@ -331,19 +352,23 @@ function _lmsolve!(
             # evaluate trial step
             xk .= x .- p
 
-            fk = fun!(fk, xk, data)
-            Fk = sum(abs2, fk)
+            Fk, fk = with_objective!(fun!, fk, xk, data; newton)
             nfev += 1
 
-            ρ = zeroT
             # ρ = actual reduction / predicted reduction
-            #   = (||f(x)|| - ||f(xk)||) / (||f(x)|| - ||f(x) + J(x)p||)
-            #   = (1 - Fk/F) / ( ||Jp||/F + 2λ||Dp||/F)
-            #   = (1 - Fk/F) / (λ||Dp||/F - <p,g>/F)
-            #   = (F - Fk)   / <p, λD'Dp - g>
+            #   = (F - Fk) / (F - ||f(x) - J(x)p||^2)
+            #   = (F - Fk) / (2⟨p,g⟩ - ||Jp||^2)
+            #   = (F - Fk) / ⟨p, g + λ D'D p⟩
+            ρ = zeroT
             if Fk < F
                 ac = F - Fk
                 pr = dot(p, (@. w = λ*DtD*p + g))
+                if newton
+                    # ρ = actual reduction / predicted reduction
+                    #   = (F - Fk) / (⟨g,p⟩ - (1/2) p' H p)
+                    #   = (F - Fk) / ((1/2) ⟨p, g + λ D'D p⟩)
+                    pr = max(pr / 2, zeroT)
+                end
                 ρ = ac / pr
                 accepted = true
             end
@@ -352,6 +377,11 @@ function _lmsolve!(
             if all(>(0), (@. w = abs(p) < ϵx * (ϵx + abs(x))))
                 if accepted
                     x, f, F = xk, fk, Fk
+                    if newton
+                        F, f, J = with_gradient!(fun!, jacobian!, f, J, x, data; newton=true)
+                        njev += 1
+                        copyto!(g, f)
+                    end
                 end
                 converged = 2
                 break
@@ -369,17 +399,27 @@ function _lmsolve!(
             F, Fk = Fk, F
 
             # check objective
-            if abs(ac) < ϵc*Fk && pr < ϵc*Fk && ρ < 2
+            if abs(ac) < ϵc*abs(Fk) && pr < ϵc*abs(Fk) && ρ < 2
                 converged = 1
                 break
             end
 
-            # jacobian J = J(x + p)
-            J = jacobian!(J, x, data)
+            if newton
+                # objective/gradient/hessian at x + p
+                F, f, J = with_gradient!(fun!, jacobian!, f, J, x, data; newton=true)
+            else
+                # jacobian J = J(x + p)
+                J = jacobian!(J, x, data)
+            end
             njev += 1
 
-            # g = J'f
-            g = _mul!(g, J', f)
+            if newton
+                # g = f
+                copyto!(g, f)
+            else
+                # g = J'f
+                g = _mul!(g, J', f)
+            end
 
             # check gradient
             if norm(g, Inf) < ϵg
@@ -387,12 +427,16 @@ function _lmsolve!(
                 break
             end
 
-            # update scaling
-            w = vec(sum!(abs2, w', J))
-            DtD .= clamp.(w, DtD, Dhi)
+            if newton
+                # DtD = I is unchanged
+            else
+                # update scaling
+                w = vec(sum!(abs2, w', J))
+                DtD .= clamp.(w, DtD, Dhi)
+            end
 
             # update solver
-            solver = update!(solver, f, LM)
+            solver = update!(solver, f, LM; newton)
 
             # update λ
             if factorupdate === :nielsen
@@ -524,6 +568,10 @@ function _lmsolve(
 
     while iter < maxit
         iter += 1
+        Fk = F
+        ac = zero(T)
+        pr = one(T)
+        ρ = zero(T)
         accepted = false
 
         # solve (J'J + λD'D) * p = J'f
@@ -551,9 +599,9 @@ function _lmsolve(
             ρ = zeroT
             # ρ = actual reduction / predicted reduction
             #   = (||f(x)|| - ||f(xk)||) / (||f(x)|| - ||f(x) + J(x)p||)
-            #   = (1 - Fk/F) / ( ||Jp||/F + 2λ||Dp||/F)
-            #   = (1 - Fk/F) / (λ||Dp||/F - <p,g>/F)
-            #   = (F - Fk)   / <p, λD'Dp - g>
+            #   = (F - Fk) / (F - ||f(x) - J(x)p||^2)
+            #   = (F - Fk) / (2⟨p,g⟩ - ||Jp||^2)
+            #   = (F - Fk) / ⟨p, g + λ D'D p⟩
             if Fk < F
                 ac = F - Fk
                 pr = dot(p, (@. λ*DtD*p + g))
@@ -639,6 +687,48 @@ end
 #####
 ##### Misc
 #####
+
+
+function with_objective!(fun!::FUN!, f::Tf, x::Tx, data::P; newton::Bool=false) where {FUN!, Tf, Tx, P}
+    ret = fun!(f, x, data)
+    if ret isa Tuple
+        F, _ = ret
+        return F, f
+    else
+        if newton
+            F = ret
+            return F, f
+        else
+            F = sum(abs2, f)
+            return F, f
+        end
+    end
+end
+
+
+function with_gradient!(
+    fun!::FUN!,
+    jacobian!::JAC!,
+    f::AbstractVector,
+    J::AbstractMatrix,
+    x,
+    data; newton::Bool=false,
+) where {FUN!, JAC!}
+    if newton
+        ret = jacobian!(J, x, data)
+        ret isa Tuple && length(ret) == 3 || throw(ArgumentError("jacobian! must return (F, f, J) when newton=true"))
+
+        F, f′, J′ = ret
+        J′ === J || copyto!(J, J′)
+        f′ === f || copyto!(f, f′)
+        return F, f, J
+    else
+        J = jacobian!(J, x, data)
+        F = sum(abs2, f)
+        return F, f, J
+    end
+end
+
 
 @inline _mul!(Y, A, B) = mul!(Y, A, B)
 
